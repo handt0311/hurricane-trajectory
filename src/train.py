@@ -1,0 +1,164 @@
+import os
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from .config import (
+    PROCESSED_NPZ,
+    EPOCHS, BATCH_SIZE, LR, WEIGHT_DECAY, PATIENCE, FACTOR, CLIP_NORM,
+    LSTM_TORCH, LSTM_SCRATCH, DEVICE, SEED,
+    CHECKPOINT_LSTM_TORCH, CHECKPOINT_LSTM_SCRATCH
+)
+from .dataset import StormSeqDataset
+from .models import LSTMForecaster, LSTMFromScratchForecaster
+from .utils import set_seed
+
+def _finite_batch(Xb, Yb):
+    x_ok = torch.isfinite(Xb).all()
+    y_ok = torch.isfinite(Yb).all()
+    return bool(x_ok and y_ok)
+
+def train_one_model(model_name: str):
+    set_seed(SEED)
+    use_device = "cuda" if (torch.cuda.is_available() and DEVICE == "cuda") else "cpu"
+    print(f"[{model_name}] Using device: {use_device}")
+
+    # Load the pre-split data
+    print(f"[Load] Loading pre-split data from {PROCESSED_NPZ}...")
+    data = np.load(PROCESSED_NPZ, allow_pickle=True)
+    X_train = data["X_train"]
+    Y_train = data["Y_train"]
+    last_tr = data["last_obs_train"]
+
+    X_val = data["X_val"]
+    Y_val = data["Y_val"]
+    last_val = data["last_obs_val"]
+
+    X_test = data["X_test"]
+    Y_test = data["Y_test"]
+    last_test = data["last_obs_test"]
+    print(f"[Load] Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+    ds_tr = StormSeqDataset(X_train, Y_train, last_tr)
+    ds_val = StormSeqDataset(X_val, Y_val, last_val)
+    ds_te = StormSeqDataset(X_test, Y_test, last_test)
+
+    dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    dl_val = DataLoader(ds_val, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+    dl_te = DataLoader(ds_te, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+
+    input_size = X_train.shape[-1]
+    out_dim = Y_train.shape[-1]
+
+    if model_name == "pytorch":
+        print(f"[{model_name}] Initializing LSTMForecaster model...")
+        model = LSTMForecaster(
+            input_size=input_size,
+            hidden_size=LSTM_TORCH["hidden_size"],
+            num_layers=LSTM_TORCH["num_layers"],
+            dropout=LSTM_TORCH["dropout"]
+        )
+        ckpt_path = CHECKPOINT_LSTM_TORCH
+    elif model_name == "scratch":
+        print(f"[{model_name}] Initializing LSTMFromScratchForecaster model...")
+        model = LSTMFromScratchForecaster(
+            in_dim=input_size,
+            hidden=LSTM_SCRATCH["hidden_size"],
+            num_layers=LSTM_SCRATCH["num_layers"],
+            out_dim=out_dim,
+            dropout=LSTM_SCRATCH["dropout"]
+        )
+        ckpt_path = CHECKPOINT_LSTM_SCRATCH
+    else:
+        raise ValueError("model_name must be 'pytorch' or 'scratch'.")
+
+    model = model.to(use_device)
+
+    optim = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="min", factor=FACTOR, patience=max(1, PATIENCE // 2))
+    criterion = torch.nn.MSELoss()
+
+    best_val = float("inf")
+    wait = 0
+    print(f"[{model_name}] Starting training for {EPOCHS} epochs...")
+    for epoch in range(1, EPOCHS + 1):
+        # ---- train ----
+        model.train()
+        loss_sum = 0.0
+        n_seen = 0
+        skipped = 0
+        for Xb, Yb, _ in dl_tr:
+            Xb = Xb.to(use_device)
+            Yb = Yb.to(use_device)
+            if not _finite_batch(Xb, Yb):
+                skipped += Xb.size(0)
+                continue
+            pred = model(Xb)  # (B,2)
+            if not torch.isfinite(pred).all():
+                # This can happen if gradients explode
+                skipped += Xb.size(0)
+                continue
+            loss = criterion(pred, Yb)
+            if not torch.isfinite(loss):
+                skipped += Xb.size(0)
+                continue
+            optim.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+            optim.step()
+            loss_sum += loss.item() * Xb.size(0)
+            n_seen += Xb.size(0)
+
+        loss_tr = float("nan") if n_seen == 0 else (loss_sum / n_seen)
+
+        # ---- val ----
+        model.eval()
+        val_sum = 0.0
+        n_val_seen = 0
+        with torch.no_grad():
+            for Xb, Yb, _ in dl_val:
+                Xb = Xb.to(use_device);
+                Yb = Yb.to(use_device)
+                if not _finite_batch(Xb, Yb):
+                    continue
+                pred = model(Xb)
+                if not torch.isfinite(pred).all():
+                    continue
+                loss = criterion(pred, Yb)
+                if not torch.isfinite(loss):
+                    continue
+                val_sum += loss.item() * Xb.size(0)
+                n_val_seen += Xb.size(0)
+        loss_va = float("nan") if n_val_seen == 0 else (val_sum / n_val_seen)
+
+        if np.isfinite(loss_va):
+            sched.step(loss_va)
+
+        info_skipped = f" | skipped_train={skipped}" if skipped else ""
+        print(
+            f"[{model_name}] Epoch {epoch:03d}/{EPOCHS} | train_loss={loss_tr:.6f} | val_loss={loss_va:.6f}{info_skipped}")
+
+        if np.isfinite(loss_va) and (loss_va < best_val):
+            best_val = loss_va
+            wait = 0
+            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"[{model_name}] -> Validation loss improved to {best_val:.6f}. Checkpoint saved.")
+        else:
+            wait += 1
+            if wait >= PATIENCE:
+                print(f"[{model_name}] Early stopping at epoch {epoch}. Best val_loss={best_val:.6f}")
+                break
+
+    print(f"[{model_name}] Training complete. Best checkpoint saved: {ckpt_path}")
+    return ckpt_path, (X_test, Y_test, last_test)
+
+
+def train(model_choice: str):
+    if model_choice == "all":
+        print("[Train] Training both models (pytorch, scratch)...")
+        train_one_model("pytorch")
+        train_one_model("scratch")
+    else:
+        print(f"[Train] Training model: {model_choice}...")
+        train_one_model(model_choice)

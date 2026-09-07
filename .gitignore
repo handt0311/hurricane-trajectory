@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+results/plots/*.html
+
+.ipynb_checkpoints
+
+scripts/
+
+.venv/
+venv/
+ENV/
+
+.idea/
